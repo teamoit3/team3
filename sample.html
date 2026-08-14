@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>メールセキュリティ教育ツール（PDFハイライト版）</title>
+<title>メールセキュリティ教育ツール（PDFハイライト版・Gemini API）</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -181,12 +181,12 @@
 <body>
 
 <header>
-  <h1>📧 メールセキュリティ教育ツール（PDFハイライト版）</h1>
+  <h1>📧 メールセキュリティ教育ツール（PDFハイライト版・Gemini API）</h1>
   <p>PDFの見た目を維持したまま、AIが検出した危険箇所をPDF上にハイライトします。</p>
 </header>
 
 <div class="toolbar">
-  <input type="password" id="apiKey" placeholder="Anthropic APIキー（デモ用）">
+  <input type="password" id="apiKey" placeholder="Gemini APIキー（デモ用）">
   <select id="literacyLevel">
     <option value="beginner">初心者向け（やさしい説明）</option>
     <option value="advanced">上級者向け（技術的な説明）</option>
@@ -222,6 +222,9 @@ import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.1.200
 
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.1.200/pdf.worker.min.mjs";
+
+// Gemini APIのモデル名。必要に応じて変更可（例: gemini-2.5-flash など）。
+const GEMINI_MODEL = "gemini-3.6-flash";
 
 const els = {
   apiKey: document.getElementById("apiKey"),
@@ -829,6 +832,16 @@ function renderAnalysis(result, flags) {
   });
 }
 
+/*
+ * Gemini APIを呼び出してメール本文を分析する。
+ *
+ * Anthropic版との主な違い:
+ * - エンドポイントが generativelanguage.googleapis.com
+ * - 認証はヘッダーではなくURLクエリの key= で渡す
+ * - リクエストボディは { contents: [{ parts: [{ text }] }] } の形式
+ * - JSONのみを返させたい場合は generationConfig.responseMimeType が使える
+ * - レスポンスは data.candidates[0].content.parts[0].text
+ */
 async function analyzeMail(maskedText, literacyLevel, apiKey) {
   const prompt = `
 あなたはメールセキュリティ教育ツールの分析エンジンです。
@@ -868,40 +881,57 @@ ITリテラシーレベル: ${literacyLevel}
 ${maskedText}
 `;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const endpoint =
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const response = await fetch(endpoint, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true"
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 2000,
-      messages: [
+      contents: [
         {
           role: "user",
-          content: prompt
+          parts: [{ text: prompt }]
         }
-      ]
+      ],
+      generationConfig: {
+        temperature: 0.2,
+        // 2000だとreason_beginner/advancedが長いflagが複数あると
+        // 出力途中で打ち切られてJSON解析に失敗することがあるため増やす
+        maxOutputTokens: 8192,
+        // モデルにJSONのみを返させる（Gemini 1.5/2.0系で対応）
+        responseMimeType: "application/json"
+      }
     })
   });
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Anthropic APIエラー ${response.status}: ${body}`);
+    throw new Error(`Gemini APIエラー ${response.status}: ${body}`);
   }
 
   const data = await response.json();
 
-  const raw = data?.content
-    ?.filter(x => x.type === "text")
-    ?.map(x => x.text)
+  // セーフティフィルタ等でブロックされた場合の分かりやすいエラー
+  const blockReason = data?.promptFeedback?.blockReason;
+  if (blockReason) {
+    throw new Error(`Geminiにより入力がブロックされました（理由: ${blockReason}）`);
+  }
+
+  const candidate = data?.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+
+  const raw = candidate?.content?.parts
+    ?.map(p => p.text || "")
     ?.join("") || "";
 
   if (!raw) {
-    throw new Error("AIからテキスト形式の応答が返りませんでした。");
+    throw new Error(
+      "AIからテキスト形式の応答が返りませんでした。" +
+      (finishReason ? `（finishReason: ${finishReason}）` : "")
+    );
   }
 
   const cleaned = raw
@@ -913,8 +943,24 @@ ${maskedText}
   try {
     return JSON.parse(cleaned);
   } catch (e) {
+    /*
+     * finishReasonがMAX_TOKENSの場合、出力が途中で打ち切られて
+     * JSONが不完全になっている可能性が高いので、その旨を明示する。
+     */
+    if (finishReason === "MAX_TOKENS") {
+      throw new Error(
+        "AIの出力が途中で打ち切られたため、JSON解析に失敗しました。" +
+        "（生成トークン数の上限に達しました）\n" +
+        "メール本文が長い場合はページ数を減らすか、maxOutputTokensを" +
+        "さらに増やしてください。\n\n受信した内容（末尾）:\n" +
+        cleaned.slice(-500)
+      );
+    }
+
     throw new Error(
-      "AIのJSON解析に失敗しました。AIの返答:\n" + cleaned.slice(0, 1000)
+      "AIのJSON解析に失敗しました。" +
+      (finishReason ? `（finishReason: ${finishReason}）\n` : "\n") +
+      "AIの返答:\n" + cleaned.slice(0, 1000)
     );
   }
 }
@@ -1011,7 +1057,7 @@ els.analyzeBtn.addEventListener("click", async () => {
   const apiKey = els.apiKey.value.trim();
 
   if (!apiKey) {
-    setStatus("Anthropic APIキーを入力してください。");
+    setStatus("Gemini APIキーを入力してください。");
     els.apiKey.focus();
     return;
   }
